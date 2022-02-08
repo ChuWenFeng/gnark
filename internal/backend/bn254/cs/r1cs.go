@@ -22,6 +22,7 @@ import (
 	"io"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/fxamacker/cbor/v2"
 
@@ -42,6 +43,148 @@ import (
 type R1CS struct {
 	compiled.R1CS
 	Coefficients []fr.Element // R1C coefficients indexes point here
+	layers Layer
+}
+
+type Layer struct{
+	mulLayerIndex [][]int//第0层表示public+secret,约束从第1层开始
+	high int
+}
+
+func (l *Layer)GetConstraints()int{
+	var sum int
+	for _,i := range l.mulLayerIndex{
+		sum += len(i)
+	}
+	return sum
+}
+
+func (cs *R1CS)Layers()error{
+	// w := witness{}
+	// if err := w.FromFullAssignment(witness); err != nil {
+	// 	return err
+	// }
+	inputs := cs.NbPublicVariables + cs.NbSecretVariables
+	nbWires := inputs + cs.NbInternalVariables
+	solved := make([]bool,nbWires)
+	variableLayer := make([]int,nbWires)
+	var layer = Layer{
+		mulLayerIndex: make([][]int, 2),
+		high: 0,
+	}
+	for i:=0;i<inputs;i++{
+		solved[i] = true
+		variableLayer[i] = 0
+	}
+	var loc uint8
+	var high = 0
+	var termToCompute compiled.Term
+	var hintFlag bool = false
+	processTerm := func(t compiled.Term, locValue uint8) error {
+		vID := t.WireID()
+
+		// wire is already computed, we just accumulate in val
+		if solved[vID] {
+			h := variableLayer[vID]
+			if h > high{
+				high = h
+			}
+			return nil
+		}
+
+		// first we check if this is a hint wire
+		if hint, ok := cs.MHints[vID]; ok {
+			if !hintFlag{
+				hintFlag = true
+				termToCompute = t
+			}
+		
+			var line compiled.LinearExpression
+			input := hint.Inputs[0]//如果有hint.Inputs[1]，则为constant，无需判断
+			switch t := input.(type){
+			case compiled.Variable: line = t.LinExp
+			case compiled.LinearExpression: line = t
+			}
+			for _,linearexp := range line{ 
+			_, viID, visibility := linearexp.Unpack()
+			if visibility == schema.Virtual{
+				continue
+			}
+			if solved[viID]{
+				h := variableLayer[viID]
+				if h > high{
+					high = h
+				}
+			}else{
+				return  errors.New("expected wire to be instantiated while evaluating hint")
+			}
+			
+			}
+			return nil
+		}
+
+		if loc != 0 {
+			panic("found more than one wire to instantiate")
+		}
+		termToCompute = t
+		loc = locValue
+		return nil
+	}
+	processHigh := func (i int)  {
+		high++
+		if high >= len(layer.mulLayerIndex) {
+			layer.mulLayerIndex = append(layer.mulLayerIndex, make([]int, 0))
+		}
+		layer.mulLayerIndex[high] = append(layer.mulLayerIndex[high], i)
+
+		if loc != 0 || hintFlag{
+			vID := termToCompute.WireID()
+			solved[vID] = true
+			variableLayer[vID] = high
+		}
+		loc = 0
+		high = 0
+		hintFlag = false
+	}
+	
+	for i:=0;i<len(cs.Constraints);i++{
+		r := cs.Constraints[i]
+		for _,t := range r.L.LinExp{
+			if err := processTerm(t,1);err != nil{
+				return err
+			}
+		}
+
+		for _, t := range r.R.LinExp {
+			if err := processTerm(t, 2); err != nil {
+				return err
+			}
+		}
+	
+		for _, t := range r.O.LinExp {
+			if err := processTerm(t, 3); err != nil {
+				return err
+			}
+		}
+		processHigh(i)
+
+	}
+
+	layer.high = len(layer.mulLayerIndex)-1
+	
+	lc := layer.GetConstraints()
+	if lc != len(cs.Constraints){
+		return errors.New("layer constraints not equal cs constraints")
+	}
+	for i,f := range solved{
+		if !f{
+			return	errors.New(fmt.Sprint("VID:",i," solved not finish"))
+		}
+	}
+
+	cs.layers = layer
+
+	return nil
 }
 
 // NewR1CS returns a new R1CS and sets cs.Coefficient (fr.Element) from provided big.Int values
@@ -53,7 +196,10 @@ func NewR1CS(cs compiled.R1CS, coefficients []big.Int) *R1CS {
 	for i := 0; i < len(coefficients); i++ {
 		r.Coefficients[i].SetBigInt(&coefficients[i])
 	}
-
+	err := r.Layers()
+	if err != nil{
+		panic(err)
+	}
 	return &r
 }
 
@@ -95,41 +241,99 @@ func (cs *R1CS) Solve(witness, a, b, c []fr.Element, opt backend.ProverConfig) (
 	defer solution.printLogs(opt.LoggerOut, cs.Logs)
 
 	// check if there is an inconsistant constraint
-	var check fr.Element
+	// var check fr.Element
 
 	// for each constraint
 	// we are guaranteed that each R1C contains at most one unsolved wire
 	// first we solve the unsolved wire (if any)
 	// then we check that the constraint is valid
 	// if a[i] * b[i] != c[i]; it means the constraint is not satisfied
-	for i := 0; i < len(cs.Constraints); i++ {
-		// solve the constraint, this will compute the missing wire of the gate
-		if err := cs.solveConstraint(cs.Constraints[i], &solution); err != nil {
-			if dID, ok := cs.MDebug[i]; ok {
-				debugInfoStr := solution.logValue(cs.DebugInfo[dID])
-				return solution.values, fmt.Errorf("%w: %s", err, debugInfoStr)
-			}
-			return solution.values, err
+	// for i := 0; i < len(cs.Constraints); i++ {
+	// 	// solve the constraint, this will compute the missing wire of the gate
+	// 	if err := cs.solveConstraint(cs.Constraints[i], &solution); err != nil {
+	// 		if dID, ok := cs.MDebug[i]; ok {
+	// 			debugInfoStr := solution.logValue(cs.DebugInfo[dID])
+	// 			return solution.values, fmt.Errorf("%w: %s", err, debugInfoStr)
+	// 		}
+	// 		return solution.values, err
+	// 	}
+
+	// 	// compute values for the R1C (ie value * coeff)
+	// 	a[i], b[i], c[i] = cs.instantiateR1C(cs.Constraints[i], &solution)
+
+	// 	// ensure a[i] * b[i] == c[i]
+	// 	check.Mul(&a[i], &b[i])
+	// 	if !check.Equal(&c[i]) {
+	// 		errMsg := fmt.Sprintf("%s ⋅ %s != %s", a[i].String(), b[i].String(), c[i].String())
+	// 		if dID, ok := cs.MDebug[i]; ok {
+	// 			errMsg = solution.logValue(cs.DebugInfo[dID])
+	// 		}
+	// 		return solution.values, fmt.Errorf("constraint #%d is not satisfied: %s", i, errMsg)
+	// 	}
+	// }
+
+	// // sanity check; ensure all wires are marked as "instantiated"
+	// if !solution.isValid() {
+	// 	panic("solver didn't instantiate all wires")
+	// }
+
+	// return solution.values, nil
+
+	type csErr struct{
+		idx int
+		err error
+		t int//0 means solve err, 1 means check err
+	}
+	var wg sync.WaitGroup
+	parallsolveConstraint := func(idx int,solveErrchan chan csErr){
+		defer wg.Done()
+		var check fr.Element
+		if err := cs.solveConstraint(cs.Constraints[idx],&solution);err != nil{
+			solveErrchan <- csErr{idx:idx,err:err,t:0}
 		}
-
-		// compute values for the R1C (ie value * coeff)
-		a[i], b[i], c[i] = cs.instantiateR1C(cs.Constraints[i], &solution)
-
-		// ensure a[i] * b[i] == c[i]
-		check.Mul(&a[i], &b[i])
-		if !check.Equal(&c[i]) {
-			errMsg := fmt.Sprintf("%s ⋅ %s != %s", a[i].String(), b[i].String(), c[i].String())
-			if dID, ok := cs.MDebug[i]; ok {
-				errMsg = solution.logValue(cs.DebugInfo[dID])
-			}
-			return solution.values, fmt.Errorf("constraint #%d is not satisfied: %s", i, errMsg)
+		a[idx],b[idx],c[idx] = cs.instantiateR1C(cs.Constraints[idx],&solution)
+		check.Mul(&a[idx],&b[idx])
+		if !check.Equal(&c[idx]){
+			solveErrchan <- csErr{idx:idx,err:err,t:1}
 		}
 	}
 
+	for i,layer := range cs.layers.mulLayerIndex{
+		solveErrchan := make(chan csErr,20)
+		for _,csIdx := range layer{
+			wg.Add(1)
+			go parallsolveConstraint(csIdx,solveErrchan)
+		}
+		go func(){
+			wg.Wait()
+			close(solveErrchan)
+		}()
+		
+		for ce := range solveErrchan{
+			fmt.Println(i)
+			if ce.t == 0{
+				if dID, ok := cs.MDebug[ce.idx]; ok {
+					debugInfoStr := solution.logValue(cs.DebugInfo[dID])
+					return solution.values, fmt.Errorf("%w: %s", err, debugInfoStr)
+				}
+				return solution.values, err
+			}else{
+				errMsg := fmt.Sprintf("%s ⋅ %s != %s", a[ce.idx].String(), b[ce.idx].String(), c[ce.idx].String())
+				if dID, ok := cs.MDebug[ce.idx]; ok {
+					errMsg = solution.logValue(cs.DebugInfo[dID])
+				}
+				return solution.values, fmt.Errorf("constraint #%d is not satisfied: %s", i, errMsg)
+			}
+		}
+		
+
+	}
+
+	// this check need put a lock in solution.set function, this will super slow, so i give up ckeck it
 	// sanity check; ensure all wires are marked as "instantiated"
-	if !solution.isValid() {
-		panic("solver didn't instantiate all wires")
-	}
+	// if !solution.isValid() {
+	// 	panic("solver didn't instantiate all wires")
+	// }
 
 	return solution.values, nil
 }
